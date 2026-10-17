@@ -96,8 +96,9 @@ pub const RESIZE_ANIMATION_THRESHOLD: f64 = 10.;
 /// Pointer needs to move this far to pull a window from the layout.
 const INTERACTIVE_MOVE_START_THRESHOLD: f64 = 256. * 256.;
 
-/// Opacity of interactively moved tiles targeting the scrolling layout.
-const INTERACTIVE_MOVE_ALPHA: f64 = 0.75;
+/// Opacity of interactively moved tiles targeting the scrolling layout. Kept
+/// opaque so the tile renders directly and keeps its background effects.
+const INTERACTIVE_MOVE_ALPHA: f64 = 1.;
 
 /// Amount of touchpad movement to toggle the overview.
 const OVERVIEW_GESTURE_MOVEMENT: f64 = 300.;
@@ -209,6 +210,7 @@ pub trait LayoutElement {
         _surface_anim_scale: Scale<f64>,
         _radius: CornerRadius,
         _xray_pos: XrayPos,
+        _force_xray: bool,
         _push: &mut dyn FnMut(BackgroundEffectElement),
     ) {
     }

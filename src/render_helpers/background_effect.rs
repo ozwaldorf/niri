@@ -113,6 +113,7 @@ impl BackgroundEffect {
         corner_radius: CornerRadius,
         effect: niri_config::BackgroundEffect,
         has_blur_region: bool,
+        force_xray: bool,
     ) {
         // If the surface explicitly requests a blur region, default blur to true.
         let blur = if has_blur_region {
@@ -128,9 +129,8 @@ impl BackgroundEffect {
             saturation: effect.saturation,
         };
 
-        // If we have some background effect but xray wasn't explicitly set, default it to true
-        // since it's cheaper.
-        if options.is_visible() && effect.xray.is_none() {
+        // Use xray for visible effects when rendering offscreen or no preference was set.
+        if options.is_visible() && (effect.xray.is_none() || force_xray) {
             options.xray = true;
         }
 
@@ -295,6 +295,7 @@ pub fn render_for_tile(
     effect: niri_config::BackgroundEffect,
     should_block_out: bool,
     xray_pos: XrayPos,
+    force_xray: bool,
     push: &mut dyn FnMut(BackgroundEffectElement),
 ) {
     with_states(surface, |states| {
@@ -305,7 +306,7 @@ pub fn render_for_tile(
         let has_blur_region = blur_region.as_ref().is_some_and(|r| !r.is_empty());
 
         background_effect.update_config(blur_config);
-        background_effect.update_render_elements(radius, effect, has_blur_region);
+        background_effect.update_render_elements(radius, effect, has_blur_region, force_xray);
 
         if !background_effect.is_visible() {
             return;
@@ -329,4 +330,37 @@ pub fn render_for_tile(
         let xray_pos = xray_pos.offset(params.geometry.loc - geometry.loc);
         background_effect.render(ctx, ns, params, xray_pos, push);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn offscreen_fallback_preserves_disabled_effects() {
+        let mut background = BackgroundEffect::new();
+        let mut effect = niri_config::BackgroundEffect::default();
+        background.update_render_elements(CornerRadius::default(), effect, false, true);
+        assert!(!background.is_visible());
+
+        effect.blur = Some(false);
+        effect.xray = Some(false);
+        background.update_render_elements(CornerRadius::default(), effect, true, true);
+        assert!(!background.is_visible());
+    }
+
+    #[test]
+    fn offscreen_fallback_preserves_surface_requested_blur() {
+        let mut background = BackgroundEffect::new();
+        let effect = niri_config::BackgroundEffect {
+            xray: Some(false),
+            ..Default::default()
+        };
+        background.update_render_elements(CornerRadius::default(), effect, true, true);
+        assert!(background.options.blur);
+        assert!(background.options.xray);
+        background.update_render_elements(CornerRadius::default(), effect, true, false);
+        assert!(background.options.blur);
+        assert!(!background.options.xray);
+    }
 }

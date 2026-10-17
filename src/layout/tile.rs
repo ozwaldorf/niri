@@ -1,4 +1,5 @@
 use core::f64;
+use std::cell::Cell;
 use std::rc::Rc;
 
 use niri_config::utils::MergeWith as _;
@@ -95,6 +96,10 @@ pub struct Tile<W: LayoutElement> {
 
     /// The animation of the tile's opacity.
     pub(super) alpha_animation: Option<AlphaAnimation>,
+
+    /// Set while rendering offscreen, where regular blur cannot capture what is
+    /// behind the tile, so xray blur is used instead.
+    rendering_offscreen: Cell<bool>,
 
     /// Offset during the initial interactive move rubberband.
     pub(super) interactive_move_offset: Point<f64, Logical>,
@@ -209,6 +214,7 @@ impl<W: LayoutElement> Tile<W> {
             move_x_animation: None,
             move_y_animation: None,
             alpha_animation: None,
+            rendering_offscreen: Cell::new(false),
             interactive_move_offset: Point::from((0., 0.)),
             unmap_snapshot: None,
             rounded_corner_damage: Default::default(),
@@ -1348,6 +1354,7 @@ impl<W: LayoutElement> Tile<W> {
             surface_anim_scale,
             radius,
             xray_pos,
+            self.rendering_offscreen.get(),
             &mut |elem| push(elem.into()),
         );
     }
@@ -1375,6 +1382,7 @@ impl<W: LayoutElement> Tile<W> {
         if let Some(open) = &self.open_animation {
             let mut ctx = ctx.as_gles();
             let mut elements = Vec::new();
+            let prev = self.rendering_offscreen.replace(true);
             self.render_inner(
                 ctx.r(),
                 Point::new(0., 0.),
@@ -1382,6 +1390,7 @@ impl<W: LayoutElement> Tile<W> {
                 focus_ring,
                 &mut |elem| elements.push(elem),
             );
+            self.rendering_offscreen.set(prev);
             match open.render(
                 ctx.renderer,
                 &elements,
@@ -1399,9 +1408,16 @@ impl<W: LayoutElement> Tile<W> {
                     warn!("error rendering window opening animation: {err:?}");
                 }
             }
-        } else if let Some(alpha) = &self.alpha_animation {
+        } else if let Some(alpha) = self
+            .alpha_animation
+            .as_ref()
+            // An animation that stays at 1 changes nothing, and rendering it
+            // offscreen would drop the background effects.
+            .filter(|alpha| tile_alpha < 1. || alpha.anim.to() < 1.)
+        {
             let mut ctx = ctx.as_gles();
             let mut elements = Vec::new();
+            let prev = self.rendering_offscreen.replace(true);
             self.render_inner(
                 ctx.r(),
                 Point::new(0., 0.),
@@ -1409,6 +1425,7 @@ impl<W: LayoutElement> Tile<W> {
                 focus_ring,
                 &mut |elem| elements.push(elem),
             );
+            self.rendering_offscreen.set(prev);
             match alpha.offscreen.render(ctx.renderer, scale, &elements) {
                 Ok((elem, _sync, data)) => {
                     let offset = elem.offset();
@@ -1452,6 +1469,9 @@ impl<W: LayoutElement> Tile<W> {
         xray_pos: XrayPos,
     ) -> TileRenderSnapshot {
         let _span = tracy_client::span!("Tile::render_snapshot");
+
+        // Snapshots are drawn later from a texture, so they cannot use regular blur.
+        let prev = self.rendering_offscreen.replace(true);
 
         let mut contents = Vec::new();
         self.render(
@@ -1538,6 +1558,7 @@ impl<W: LayoutElement> Tile<W> {
         );
 
         // Put everything back to normal.
+        self.rendering_offscreen.set(prev);
         if let Some(xray) = &mut xray {
             if xray_has_blocked_out_layers {
                 xray.background[output_idx] = output_background.take().unwrap();

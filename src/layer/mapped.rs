@@ -251,6 +251,7 @@ impl MappedLayer {
             self.rules.background_effect,
             should_block_out,
             xray_pos,
+            false,
             &mut |elem| push(elem.into()),
         );
     }
@@ -320,6 +321,7 @@ impl MappedLayer {
                 effect,
                 false,
                 xray_pos,
+                false,
                 &mut |elem| push(elem.into()),
             );
         }
