@@ -161,11 +161,14 @@ fn cursor_capture_size(niri: &Niri, output: &Output) -> Size<i32, BufferCoords> 
         RenderCursor::Named {
             scale: buffer_scale,
             cursor,
+            frame,
             ..
         } => {
             // All frames are the same size since CursorManager::load_xcursor()
             // picks one size and rejects frames which differ.
-            let (_idx, frame) = cursor.frame(niri.start_time.elapsed().as_millis() as u32);
+            let frame = frame
+                .map(|idx| &cursor.frames()[idx])
+                .unwrap_or_else(|| cursor.frame(niri.start_time.elapsed().as_millis() as u32).1);
             // The image is loaded at the integer scale but drawn at the fractional one, so it
             // ends up smaller than its own buffer whenever the two differ.
             let logical = Size::<f64, Logical>::from((
@@ -204,12 +207,15 @@ pub fn cursor_capture_hotspot(niri: &Niri, output: &Output) -> Point<i32, Buffer
         RenderCursor::Named {
             scale: buffer_scale,
             cursor,
+            frame,
             ..
         } => {
-            let (_idx, frame) = cursor.frame(niri.start_time.elapsed().as_millis() as u32);
+            let frame = frame
+                .map(|idx| &cursor.frames()[idx])
+                .unwrap_or_else(|| cursor.frame(niri.start_time.elapsed().as_millis() as u32).1);
             // Same rescaling as in cursor_capture_size().
             XCursor::hotspot(frame)
-                .to_logical(buffer_scale)
+                .to_logical(buffer_scale as f64)
                 .to_f64()
                 .to_physical_precise_round(scale)
         }

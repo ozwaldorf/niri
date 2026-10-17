@@ -4003,16 +4003,19 @@ impl Niri {
                 );
             }
             RenderCursor::Named {
-                icon,
+                name,
                 scale,
                 cursor,
+                frame,
             } => {
-                let (idx, frame) = cursor.frame(self.start_time.elapsed().as_millis() as u32);
-                let hotspot = XCursor::hotspot(frame).to_logical(scale);
+                let (idx, frame) = frame
+                    .map(|idx| (idx, &cursor.frames()[idx]))
+                    .unwrap_or_else(|| cursor.frame(self.start_time.elapsed().as_millis() as u32));
+                let hotspot = XCursor::hotspot(frame).to_logical(scale as f64);
                 let pointer_pos =
                     (pointer_pos - hotspot.to_f64()).to_physical_precise_round(output_scale);
 
-                let texture = self.cursor_texture_cache.get(icon, scale, &cursor, idx);
+                let texture = self.cursor_texture_cache.get(name, scale, &cursor, idx);
                 match MemoryRenderBufferRenderElement::from_buffer(
                     renderer,
                     pointer_pos,
@@ -4222,9 +4225,10 @@ impl Niri {
 
                     // For simplicity, we always use frame 0 for this computation. Let's hope the
                     // hotspot doesn't change between frames.
-                    let hotspot = XCursor::hotspot(&cursor.frames()[0]).to_logical(output_scale);
+                    let hotspot =
+                        XCursor::hotspot(&cursor.frames()[0]).to_logical(output_scale as f64);
 
-                    let surface_pos = pointer_pos.to_i32_round() - hotspot;
+                    let surface_pos = (pointer_pos - hotspot).to_i32_round();
                     let bbox = bbox_from_surface_tree(surface, surface_pos);
 
                     if let Some(mut overlap) = geo.intersection(bbox) {
@@ -5940,12 +5944,15 @@ impl Niri {
                 );
             }
             RenderCursor::Named {
-                icon,
+                name,
                 scale,
                 cursor,
+                frame,
             } => {
-                let (idx, _frame) = cursor.frame(self.start_time.elapsed().as_millis() as u32);
-                let texture = self.cursor_texture_cache.get(icon, scale, &cursor, idx);
+                let idx = frame.unwrap_or_else(|| {
+                    cursor.frame(self.start_time.elapsed().as_millis() as u32).0
+                });
+                let texture = self.cursor_texture_cache.get(name, scale, &cursor, idx);
                 match MemoryRenderBufferRenderElement::from_buffer(
                     renderer,
                     Point::<f64, _>::from((0., 0.)),
