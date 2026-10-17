@@ -580,9 +580,7 @@ impl Niri {
                 let mut pointer_pos = Point::default();
                 if self.pointer_visibility.is_visible() {
                     let output_geo = self.global_space.output_geometry(output).unwrap().to_f64();
-                    let pointer_loc = self
-                        .tablet_cursor_location
-                        .unwrap_or_else(|| self.seat.get_pointer().unwrap().current_location());
+                    let pointer_loc = self.drawn_cursor_location();
                     // Only render when the pointer is within the output. Otherwise, it will
                     // happily appear anywhere outside the output video source in OBS.
                     if output_geo.contains(pointer_loc) {

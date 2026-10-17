@@ -124,7 +124,7 @@ use crate::a11y::A11y;
 use crate::animation::Clock;
 use crate::backend::tty::SurfaceDmabufFeedback;
 use crate::backend::{Backend, Headless, RenderResult, Tty, Winit};
-use crate::cursor::{CursorManager, CursorTextureCache, RenderCursor, XCursor};
+use crate::cursor::{CursorManager, CursorPhysics, CursorTextureCache, RenderCursor, XCursor};
 #[cfg(feature = "dbus")]
 use crate::dbus::freedesktop_locale1::Locale1ToNiri;
 #[cfg(feature = "dbus")]
@@ -163,6 +163,7 @@ use crate::protocols::mutter_x11_interop::MutterX11InteropManagerState;
 use crate::protocols::output_management::OutputManagementManagerState;
 use crate::protocols::screencopy::{Screencopy, ScreencopyBuffer, ScreencopyManagerState};
 use crate::render_helpers::blur::BlurOptions;
+use crate::render_helpers::cursor::CursorRenderElement;
 use crate::render_helpers::debug::push_opaque_regions;
 use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::renderer::NiriRenderer;
@@ -386,6 +387,7 @@ pub struct Niri {
 
     pub cursor_manager: CursorManager,
     pub cursor_texture_cache: CursorTextureCache,
+    pub cursor_physics: CursorPhysics,
     pub cursor_shape_manager_state: CursorShapeManagerState,
     pub dnd_icon: Option<DndIcon>,
     /// Contents under pointer.
@@ -867,6 +869,7 @@ impl State {
         self.niri.refresh_layout();
 
         self.niri.cursor_manager.check_cursor_image_surface_alive();
+        self.niri.advance_cursor_physics();
         self.niri.refresh_pointer_outputs();
         self.niri.global_space.refresh();
         self.niri.refresh_idle_inhibit();
@@ -1011,6 +1014,7 @@ impl State {
         self.niri.pointer_contents.clone_from(&under);
 
         let pointer = &self.niri.seat.get_pointer().unwrap();
+        let from = pointer.current_location();
         pointer.motion(
             self,
             under.surface,
@@ -1021,6 +1025,8 @@ impl State {
             },
         );
         pointer.frame(self);
+        // A grab may have kept the pointer in place.
+        self.niri.glide_cursor(from, pointer.current_location());
 
         self.niri.maybe_activate_pointer_constraint();
 
@@ -2837,6 +2843,7 @@ impl Niri {
             configured_keymap: None,
             cursor_manager,
             cursor_texture_cache: Default::default(),
+            cursor_physics: Default::default(),
             cursor_shape_manager_state,
             dnd_icon: None,
             pointer_contents: PointContents::default(),
@@ -3964,6 +3971,43 @@ impl Niri {
         }
     }
 
+    /// Location of the tablet cursor while it's active, otherwise of the pointer.
+    pub fn cursor_location(&self) -> Point<f64, Logical> {
+        self.tablet_cursor_location
+            .unwrap_or_else(|| self.seat.get_pointer().unwrap().current_location())
+    }
+
+    /// Cursor location including the visual warp offset.
+    pub fn drawn_cursor_location(&self) -> Point<f64, Logical> {
+        self.cursor_location() + self.cursor_physics.offset()
+    }
+
+    /// Glides the drawn cursor across a programmatic pointer move from `from` to `to`.
+    pub fn glide_cursor(&mut self, from: Point<f64, Logical>, to: Point<f64, Logical>) {
+        // The tablet cursor is drawn instead of the pointer while it's active.
+        if self.tablet_cursor_location.is_none() {
+            self.cursor_physics.warp(self.clock.now(), from, to);
+        }
+    }
+
+    /// Moves the drawn cursor instantly along with a programmatic pointer move.
+    pub fn jump_cursor(&mut self, from: Point<f64, Logical>, to: Point<f64, Logical>) {
+        if self.tablet_cursor_location.is_none() {
+            self.cursor_physics.jump(self.clock.now(), from, to);
+        }
+    }
+
+    /// Switching between the tablet cursor and the pointer is not cursor motion.
+    pub fn set_tablet_cursor_location(&mut self, location: Option<Point<f64, Logical>>) {
+        let from = self.cursor_location();
+        let switched = location.is_some() != self.tablet_cursor_location.is_some();
+        self.tablet_cursor_location = location;
+        if switched {
+            self.cursor_physics
+                .jump(self.clock.now(), from, self.cursor_location());
+        }
+    }
+
     pub fn render_pointer<R: NiriRenderer>(
         &self,
         renderer: &mut R,
@@ -3974,11 +4018,7 @@ impl Niri {
         let output_scale = output.current_scale();
         let output_pos = self.global_space.output_geometry(output).unwrap().loc;
 
-        // Check whether we need to draw the tablet cursor or the regular cursor.
-        let pointer_pos = self
-            .tablet_cursor_location
-            .unwrap_or_else(|| self.seat.get_pointer().unwrap().current_location());
-        let pointer_pos = pointer_pos - output_pos.to_f64();
+        let pointer_pos = self.drawn_cursor_location() - output_pos.to_f64();
 
         // Get the render cursor to draw.
         let cursor_scale = output_scale.integer_scale();
@@ -4008,13 +4048,14 @@ impl Niri {
                 cursor,
             } => {
                 let (idx, frame) = cursor.frame(self.start_time.elapsed().as_millis() as u32);
-                let hotspot = XCursor::hotspot(frame).to_logical(scale);
+                let buffer_hotspot = XCursor::hotspot(frame);
+                let hotspot = buffer_hotspot.to_logical(scale);
                 let pointer_pos =
                     (pointer_pos - hotspot.to_f64()).to_physical_precise_round(output_scale);
 
                 let texture = self.cursor_texture_cache.get(icon, scale, &cursor, idx);
                 match MemoryRenderBufferRenderElement::from_buffer(
-                    renderer,
+                    renderer.as_gles_renderer(),
                     pointer_pos,
                     &texture,
                     None,
@@ -4022,7 +4063,15 @@ impl Niri {
                     None,
                     Kind::Cursor,
                 ) {
-                    Ok(element) => push(element.into()),
+                    Ok(element) => push(
+                        CursorRenderElement::new(
+                            element,
+                            (buffer_hotspot.x as f32, buffer_hotspot.y as f32),
+                            self.cursor_physics.angle(),
+                            self.cursor_physics.commit(),
+                        )
+                        .into(),
+                    ),
                     Err(err) => {
                         warn!("error importing a cursor texture: {err:?}");
                     }
@@ -4112,10 +4161,7 @@ impl Niri {
 
         let _span = tracy_client::span!("Niri::refresh_pointer_outputs");
 
-        // Check whether we need to draw the tablet cursor or the regular cursor.
-        let pointer_pos = self
-            .tablet_cursor_location
-            .unwrap_or_else(|| self.seat.get_pointer().unwrap().current_location());
+        let pointer_pos = self.drawn_cursor_location();
 
         match self.cursor_manager.cursor_image() {
             CursorImageStatus::Surface(ref surface) => {
@@ -4346,6 +4392,15 @@ impl Niri {
                 }
             }
         }
+    }
+
+    fn advance_cursor_physics(&mut self) {
+        // Advance before cursor metadata is refreshed, using one time for all outputs.
+        if self.clock.should_complete_instantly() {
+            self.cursor_physics.reset();
+        }
+        self.cursor_physics
+            .update(self.clock.now(), self.cursor_location());
     }
 
     pub fn update_render_elements(&mut self, output: Option<&Output>) {
@@ -4888,6 +4943,8 @@ impl Niri {
             state.unfinished_animations_remain |= self
                 .cursor_manager
                 .is_current_cursor_animated(output.current_scale().integer_scale());
+            state.unfinished_animations_remain |=
+                self.pointer_visibility.is_visible() && self.cursor_physics.is_active();
 
             // Also check layer surfaces.
             if !state.unfinished_animations_remain {
@@ -5975,9 +6032,7 @@ impl Niri {
 
         let _span = tracy_client::span!("Niri::refresh_image_copy_cursor_sessions");
 
-        let pointer_pos = self
-            .tablet_cursor_location
-            .unwrap_or_else(|| self.seat.get_pointer().unwrap().current_location());
+        let pointer_pos = self.drawn_cursor_location();
 
         let mut sessions = mem::take(&mut self.image_copy_cursor_sessions);
         for s in &mut sessions {
@@ -7238,6 +7293,7 @@ niri_render_elements! {
     PointerRenderElements<R> => {
         Wayland = WaylandSurfaceRenderElement<R>,
         NamedPointer = MemoryRenderBufferRenderElement<R>,
+        RotatedPointer = CursorRenderElement,
     }
 }
 

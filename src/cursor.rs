@@ -4,16 +4,20 @@ use std::env;
 use std::fs::File;
 use std::io::Read;
 use std::rc::Rc;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context};
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::memory::MemoryRenderBuffer;
+use smithay::backend::renderer::utils::CommitCounter;
 use smithay::input::pointer::{CursorIcon, CursorImageStatus, CursorImageSurfaceData};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{IsAlive, Logical, Physical, Point, Transform};
 use smithay::wayland::compositor::with_states;
 use xcursor::parser::{parse_xcursor, Image};
 use xcursor::CursorTheme;
+
+use crate::animation::{Animation, Clock, Curve};
 
 /// Some default looking `left_ptr` icon.
 static FALLBACK_CURSOR_DATA: &[u8] = include_bytes!("../resources/cursor.rgba");
@@ -267,6 +271,137 @@ impl CursorTextureCache {
     }
 }
 
+/// Tilt settling threshold, in degrees.
+const TILT_SETTLE_DEG: f64 = 0.125;
+/// Largest tilt, in degrees.
+const TILT_MAX_DEG: f64 = 22.;
+/// Horizontal speed, in logical px/s, at which the tilt reaches ~76% of the maximum.
+const TILT_SPEED: f64 = 800.;
+/// Time constant of the tilt smoothing, in seconds.
+const TILT_TAU: f64 = 0.08;
+/// Duration of a programmatic pointer glide, in milliseconds.
+const GLIDE_DURATION_MS: u64 = 350;
+/// Gaps between updates longer than this, in seconds, settle the simulation at rest.
+const MAX_GAP: f64 = 0.25;
+
+/// Smoothed tilt following horizontal velocity and eased glides across pointer warps.
+#[derive(Default)]
+pub struct CursorPhysics {
+    /// Last update time and pointer position, moved along with warps since.
+    last: Option<(Duration, Point<f64, Logical>)>,
+    angle: f64,
+    /// Drawn position relative to the pointer.
+    offset: Point<f64, Logical>,
+    /// Initial offset and remaining fraction of the current glide.
+    glide: Option<(Point<f64, Logical>, Animation)>,
+    /// Incremented whenever the angle changes.
+    commit: CommitCounter,
+}
+
+impl CursorPhysics {
+    /// Keeps the cursor drawn where it is while the pointer warps from `from` to `to`.
+    pub fn warp(&mut self, time: Duration, from: Point<f64, Logical>, to: Point<f64, Logical>) {
+        self.jump(time, from, to);
+        if from == to {
+            return;
+        }
+        self.offset += from - to;
+        self.glide = Some((
+            self.offset,
+            Animation::ease(
+                Clock::with_time(self.last.unwrap().0),
+                1.,
+                0.,
+                0.,
+                GLIDE_DURATION_MS,
+                Curve::from(niri_config::animations::Curve::CubicBezier(
+                    0.42, 0., 0.58, 1.,
+                )),
+            ),
+        ));
+    }
+
+    /// Moves the drawn cursor along with a pointer jump from `from` to `to` that isn't motion.
+    pub fn jump(&mut self, time: Duration, from: Point<f64, Logical>, to: Point<f64, Logical>) {
+        self.update(time, from);
+        if let Some((_, pos)) = &mut self.last {
+            *pos += to - from;
+        }
+    }
+
+    /// Advances the simulation to `time` with the pointer at `pos`.
+    pub fn update(&mut self, time: Duration, pos: Point<f64, Logical>) {
+        let Some((last_time, last_pos)) = self.last else {
+            self.last = Some((time, pos));
+            return;
+        };
+        if time <= last_time {
+            return;
+        }
+        let dt = (time - last_time).as_secs_f64();
+        if dt > MAX_GAP {
+            self.settle(Some((time, pos)));
+            return;
+        }
+        let last_drawn = last_pos + self.offset;
+        if let Some((from, animation)) = &self.glide {
+            let remaining = animation.value_at(time);
+            self.offset = from.upscale(remaining);
+            if remaining == 0. {
+                self.glide = None;
+            }
+        }
+
+        let drawn = pos + self.offset;
+        self.last = Some((time, pos));
+        let target = TILT_MAX_DEG * ((drawn - last_drawn).x / dt / TILT_SPEED).tanh();
+        let angle = self.angle + (target - self.angle) * (1. - (-dt / TILT_TAU).exp());
+        if angle != self.angle {
+            self.angle = angle;
+            self.commit.increment();
+        }
+
+        if !self.is_active() {
+            self.settle(self.last);
+        }
+    }
+
+    /// Drops any tilt and glide.
+    pub fn reset(&mut self) {
+        self.settle(None);
+    }
+
+    fn settle(&mut self, last: Option<(Duration, Point<f64, Logical>)>) {
+        if self.angle != 0. {
+            self.commit.increment();
+        }
+        *self = Self {
+            last,
+            commit: self.commit,
+            ..Self::default()
+        };
+    }
+
+    /// Current clockwise tilt in degrees.
+    pub fn angle(&self) -> f64 {
+        self.angle
+    }
+
+    /// Drawn cursor position relative to the pointer.
+    pub fn offset(&self) -> Point<f64, Logical> {
+        self.offset
+    }
+
+    /// Commit counter tracking angle changes for damage.
+    pub fn commit(&self) -> CommitCounter {
+        self.commit
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.angle.abs() > TILT_SETTLE_DEG || self.glide.is_some()
+    }
+}
+
 // The XCursorBuffer implementation is inspired by `wayland-rs`, thus provided under MIT license.
 
 /// The state of the `NamedCursor`.
@@ -314,5 +449,117 @@ impl XCursor {
     /// Get hotspot for the given `image`.
     pub fn hotspot(image: &Image) -> Point<i32, Physical> {
         (image.xhot as i32, image.yhot as i32).into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tilt_follows_motion_and_settles() {
+        let mut physics = CursorPhysics::default();
+        let mut time = Duration::ZERO;
+        let mut pos = Point::from((0., 0.));
+        physics.update(time, pos);
+        for _ in 0..30 {
+            time += Duration::from_millis(16);
+            pos.x += 20.;
+            physics.update(time, pos);
+        }
+        assert!(physics.angle() > 5.);
+        for _ in 0..200 {
+            time += Duration::from_millis(16);
+            physics.update(time, pos);
+        }
+        assert!(!physics.is_active());
+        assert_eq!(physics.angle(), 0.);
+    }
+
+    #[test]
+    fn warp_glides_to_pointer() {
+        let mut physics = CursorPhysics::default();
+        let mut time = Duration::ZERO;
+        let (from, to) = (Point::from((0., 0.)), Point::from((1000., 0.)));
+        physics.update(time, from);
+        physics.warp(time, from, to);
+        assert_eq!(physics.offset(), Point::from((-1000., 0.)));
+        let mut last = from.x;
+        let mut speed = 0.;
+        for i in 0..20 {
+            time = Duration::from_millis(GLIDE_DURATION_MS) * (i + 1) / 20;
+            physics.update(time, to);
+            let drawn = (to + physics.offset()).x;
+            assert!(drawn > last && drawn <= to.x);
+            // Eases in rather than starting at full speed.
+            if i < 3 {
+                assert!(drawn - last > speed);
+            }
+            speed = drawn - last;
+            last = drawn;
+        }
+        assert_eq!(to + physics.offset(), to);
+        assert!(physics.angle() > 0.);
+    }
+
+    #[test]
+    fn interrupted_warp_keeps_drawn_position() {
+        let mut physics = CursorPhysics::default();
+        let (from, first, second) = (
+            Point::from((0., 0.)),
+            Point::from((1000., 0.)),
+            Point::from((-500., 300.)),
+        );
+        physics.update(Duration::ZERO, from);
+        physics.warp(Duration::ZERO, from, first);
+        let mut time = Duration::from_millis(80);
+        physics.update(time, first);
+        let drawn = first + physics.offset();
+        physics.warp(time, first, second);
+        assert_eq!(second + physics.offset(), drawn);
+        for _ in 0..50 {
+            time += Duration::from_millis(16);
+            physics.update(time, second);
+        }
+        assert_eq!(physics.offset(), Point::default());
+        assert!(!physics.is_active());
+    }
+
+    #[test]
+    fn warp_timing_preserves_drawn_position() {
+        // Idle warp and warp timestamp older than the last update.
+        for (last, warp, next) in [(0, 10_000, 10_016), (16, 10, 32)] {
+            let mut physics = CursorPhysics::default();
+            let (from, to) = (Point::from((0., 0.)), Point::from((1000., 0.)));
+            physics.update(Duration::ZERO, from);
+            physics.update(Duration::from_millis(last), from);
+            physics.warp(Duration::from_millis(warp), from, to);
+            assert_eq!(to + physics.offset(), from);
+            physics.update(Duration::from_millis(next), to);
+            let drawn = to + physics.offset();
+            assert!(drawn.x > from.x && drawn.x < 50., "warp at {warp}ms");
+        }
+    }
+
+    #[test]
+    fn jump_is_not_motion() {
+        let mut physics = CursorPhysics::default();
+        let (from, to) = (Point::from((0., 0.)), Point::from((300., 0.)));
+        physics.update(Duration::ZERO, from);
+        physics.jump(Duration::from_millis(8), from, to);
+        physics.update(Duration::from_millis(16), to);
+        assert!(!physics.is_active());
+        assert_eq!(physics.offset(), Point::from((0., 0.)));
+    }
+
+    #[test]
+    fn long_gap_settles_glide() {
+        let mut physics = CursorPhysics::default();
+        let (from, to) = (Point::from((0., 0.)), Point::from((1000., 0.)));
+        physics.update(Duration::ZERO, from);
+        physics.warp(Duration::ZERO, from, to);
+        physics.update(Duration::from_secs(1), to);
+        assert!(!physics.is_active());
+        assert_eq!(physics.offset(), Point::from((0., 0.)));
     }
 }

@@ -16,6 +16,7 @@ pub struct Shaders {
     pub clipped_surface: Option<GlesTexProgram>,
     pub postprocess_and_clip: Option<GlesTexProgram>,
     pub resize: Option<ShaderProgram>,
+    pub cursor: Option<GlesTexProgram>,
     pub gradient_fade: Option<GlesTexProgram>,
     pub blur: Option<BlurProgram>,
     pub custom_resize: RefCell<Option<ShaderProgram>>,
@@ -132,6 +133,14 @@ impl Shaders {
             })
             .ok();
 
+        let cursor = renderer
+            .compile_custom_texture_shader(
+                include_str!("cursor.frag"),
+                &[UniformName::new("rotation", UniformType::Matrix3x3)],
+            )
+            .map_err(|err| warn!("error compiling cursor shader: {err:?}"))
+            .ok();
+
         let gradient_fade = renderer
             .compile_custom_texture_shader(
                 include_str!("gradient_fade.frag"),
@@ -155,6 +164,7 @@ impl Shaders {
             postprocess_and_clip,
             resize,
             gradient_fade,
+            cursor,
             blur,
             custom_resize: RefCell::new(None),
             custom_close: RefCell::new(None),

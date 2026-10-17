@@ -222,6 +222,7 @@ impl PointerConstraintsHandler for State {
             return;
         }
 
+        self.niri.jump_cursor(pointer.current_location(), target);
         pointer.set_location(target);
 
         // Redraw to update the cursor position if it's visible.

@@ -2510,7 +2510,7 @@ impl State {
 
         // We received an event for the regular pointer, so show it now.
         self.niri.pointer_visibility = PointerVisibility::Visible;
-        self.niri.tablet_cursor_location = None;
+        self.niri.set_tablet_cursor_location(None);
 
         // Check if we have an active pointer constraint.
         //
@@ -2811,7 +2811,7 @@ impl State {
         self.niri.pointer_visibility = PointerVisibility::Visible;
 
         // We moved the regular pointer, so show it now.
-        self.niri.tablet_cursor_location = None;
+        self.niri.set_tablet_cursor_location(None);
 
         // Inform the layout of an ongoing DnD operation.
         let is_dnd_grab = pointer
@@ -2904,7 +2904,7 @@ impl State {
 
             // We received an event for the regular pointer, so show it now.
             self.niri.pointer_visibility = PointerVisibility::Visible;
-            self.niri.tablet_cursor_location = None;
+            self.niri.set_tablet_cursor_location(None);
 
             let is_overview_open = self.niri.layout.is_overview_open();
 
@@ -3174,7 +3174,7 @@ impl State {
         // update_pointer_contents() below to return the real contents, necessary for the pointer
         // axis event to reach the window.
         self.niri.pointer_visibility = PointerVisibility::Visible;
-        self.niri.tablet_cursor_location = None;
+        self.niri.set_tablet_cursor_location(None);
 
         let timestamp = Duration::from_micros(event.time().micros());
 
@@ -3719,7 +3719,7 @@ impl State {
             }
 
             self.niri.pointer_visibility = PointerVisibility::Visible;
-            self.niri.tablet_cursor_location = Some(pos);
+            self.niri.set_tablet_cursor_location(Some(pos));
         }
 
         // Redraw to update the cursor position.
@@ -3930,7 +3930,7 @@ impl State {
                     tool.frame(self, time);
 
                     self.niri.pointer_visibility = PointerVisibility::Visible;
-                    self.niri.tablet_cursor_location = Some(pos);
+                    self.niri.set_tablet_cursor_location(Some(pos));
                 }
                 ProximityState::Out => {
                     tool.proximity_out(self, &tablet::tool::ProximityOutEvent { serial, time });
@@ -3945,7 +3945,7 @@ impl State {
                     }
 
                     self.niri.pointer_visibility = PointerVisibility::Visible;
-                    self.niri.tablet_cursor_location = None;
+                    self.niri.set_tablet_cursor_location(None);
                 }
             }
 
